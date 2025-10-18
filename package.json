@@ -1,0 +1,22 @@
+{
+  "name": "superpowers-skill",
+  "version": "0.1.0",
+  "main": "src/plugin.ts",
+  "type": "module",
+  "scripts": {
+    "build": "tsc --noEmit",
+    "install-plugin": "cp src/plugin.ts ~/.config/opencode/plugin/skills.ts",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^0.15.7"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.0.0",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.0.0"
+  },
+  "engines": {
+    "bun": ">=1.0.0"
+  }
+}
