@@ -16,8 +16,74 @@ import { tool } from "@opencode-ai/plugin";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { homedir } from "node:os";
-import * as yaml from "js-yaml";
 import { z } from "zod";
+
+/**
+ * Parse simple YAML frontmatter.
+ * Handles the subset used by Anthropic Agent Skills Spec:
+ * - Simple key: value strings
+ * - Arrays (lines starting with "  - ")
+ * - Nested objects (indented key: value under a parent key)
+ */
+function parseYamlFrontmatter(text: string): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+  const lines = text.split('\n');
+  let currentKey: string | null = null;
+  let currentArray: string[] | null = null;
+  let currentObject: Record<string, string> | null = null;
+
+  for (const line of lines) {
+    // Skip empty lines
+    if (line.trim() === '') continue;
+
+    // Check for array item (starts with "  - ")
+    if (line.match(/^\s{2}-\s+/) && currentKey !== null) {
+      const value = line.replace(/^\s{2}-\s+/, '').trim();
+      if (currentArray === null) {
+        currentArray = [];
+        result[currentKey] = currentArray;
+      }
+      currentArray.push(value);
+      continue;
+    }
+
+    // Check for nested object value (starts with "  " but not "  - ")
+    if (line.match(/^\s{2}\w/) && currentKey !== null) {
+      const nestedMatch = line.match(/^\s{2}(\w[\w-]*)\s*:\s*(.*)$/);
+      if (nestedMatch && nestedMatch[1] && nestedMatch[2] !== undefined) {
+        if (currentObject === null) {
+          currentObject = {};
+          result[currentKey] = currentObject;
+        }
+        currentObject[nestedMatch[1]] = nestedMatch[2].trim();
+        continue;
+      }
+    }
+
+    // Top-level key: value
+    const topMatch = line.match(/^([\w-]+)\s*:\s*(.*)$/);
+    if (topMatch && topMatch[1] && topMatch[2] !== undefined) {
+      // Save any pending array/object
+      currentArray = null;
+      currentObject = null;
+
+      const key = topMatch[1];
+      const value = topMatch[2].trim();
+      currentKey = key;
+
+      // If value is empty, it's the start of an array or object
+      if (value === '') {
+        continue;
+      }
+
+      // Remove surrounding quotes if present
+      const unquoted = value.replace(/^["'](.*)["']$/, '$1');
+      result[key] = unquoted;
+    }
+  }
+
+  return result;
+}
 
 interface Script {
   name: string;
@@ -183,10 +249,10 @@ async function parseSkillFile(
   const frontmatterText = frontmatterMatch[1];
   const skillContent = frontmatterMatch[2].trim();
 
-  // Parse YAML
+  // Parse YAML frontmatter
   let frontmatterObj: unknown;
   try {
-    frontmatterObj = yaml.load(frontmatterText);
+    frontmatterObj = parseYamlFrontmatter(frontmatterText);
   } catch {
     console.error(`   Invalid YAML in ${skillPath}`);
     return null;
