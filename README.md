@@ -4,30 +4,21 @@ A dynamic skills plugin for OpenCode that provides tools for loading and using r
 
 ## Installation
 
-### From Git Repo
+Tell OpenCode:
 
-`opencode.json`
-```json
-{
-  "plugin": ["github:joshuadavidthomas/opencode-agent-skills"]
-}
+```
+Fetch and follow instructions from https://raw.githubusercontent.com/joshuadavidthomas/opencode-agent-skills/refs/heads/main/INSTALL.md
 ```
 
-### Local
-
-Clone the repository:
+Or install manually:
 
 ```bash
-git clone https://github.com/joshuadavidthomas/opencode-agent-skills.git
+git clone https://github.com/joshuadavidthomas/opencode-agent-skills ~/.config/opencode/opencode-agent-skills
+mkdir -p ~/.config/opencode/plugin
+ln -sf ~/.config/opencode/opencode-agent-skills/src/plugin.ts ~/.config/opencode/plugin/skills.ts
 ```
 
-Then add to your `opencode.json`:
-
-```json
-{
-  "plugin": ["/path/to/opencode-agent-skills/src/plugin.ts"]
-}
-```
+Restart OpenCode and you're ready to go.
 
 ## Usage
 
