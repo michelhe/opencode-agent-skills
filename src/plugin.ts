@@ -1,334 +1,683 @@
-import type { Plugin } from "@opencode-ai/plugin";
+/**
+ * OpenCode Agent Skills Plugin
+ *
+ * A dynamic skills system that provides 4 tools:
+ * - use_skill: Load a skill's SKILL.md into context
+ * - read_skill_file: Read supporting files from a skill directory
+ * - run_skill_script: Execute scripts from a skill directory
+ * - find_skills: Search and list available skills
+ *
+ * Skills are discovered from multiple locations (project > user > marketplace)
+ * and validated against the Anthropic Agent Skills Spec.
+ */
+
+import type { Plugin, PluginInput, ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
-import * as fs from "fs/promises";
-import * as path from "path";
-import { homedir } from "os";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import { homedir } from "node:os";
+import * as yaml from "js-yaml";
+import { z } from "zod";
+
+interface Script {
+  name: string;
+  path: string;
+}
+
+type SkillLabel = "project" | "user" | "claude-project" | "claude-user" | "claude-plugins";
 
 interface SkillMetadata {
   name: string;
   description: string;
-  id: string;
   path: string;
-}
-
-interface ParsedSkill extends SkillMetadata {
+  relativePath: string;
+  namespace?: string;
+  label: SkillLabel;
+  scripts: Script[];
   content: string;
 }
 
-// Define skill frontmatter schema
-const skillFrontmatterSchema = tool.schema.object({
-  name: tool.schema.string().max(64),
-  description: tool.schema.string().max(1024)
+interface DiscoveryPath {
+  path: string;
+  label: SkillLabel;
+  maxDepth: number;
+}
+
+interface MarketplaceManifest {
+  plugins: Array<{
+    name: string;
+    skills?: string[];
+  }>;
+}
+
+interface InstalledPlugins {
+  plugins: {
+    [key: string]: {
+      installPath: string;
+    };
+  };
+}
+
+/**
+ * Anthropic Agent Skills Spec v1.0 compliant schema.
+ * @see https://github.com/anthropics/skills/blob/main/agent_skills_spec.md
+ */
+const SkillFrontmatterSchema = z.object({
+  // Required fields
+  name: z.string()
+    .regex(/^[\p{Ll}\p{N}-]+$/u, { message: "Name must be lowercase alphanumeric with hyphens" })
+    .min(1, { message: "Name cannot be empty" }),
+  description: z.string()
+    .min(1, { message: "Description cannot be empty" }),
+
+  // Optional fields (per spec)
+  license: z.string().optional(),
+  "allowed-tools": z.array(z.string()).optional(),
+  metadata: z.record(z.string(), z.string()).optional()
 });
 
-async function parseSkillFile(skillPath: string): Promise<ParsedSkill | null> {
-  const content = await fs.readFile(skillPath, 'utf-8').catch(() => null);
-  if (!content) return null;
+type SkillFrontmatter = z.infer<typeof SkillFrontmatterSchema>;
 
-  // Parse YAML frontmatter
-  const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
-  if (!frontmatterMatch) return null;
+/**
+ * Inject content into session via noReply + synthetic.
+ * Content persists across context compaction.
+ */
+type OpencodeClient = PluginInput["client"];
 
-  const frontmatterText = frontmatterMatch[1];
-  const skillContent = frontmatterMatch[2];
+async function injectSyntheticContent(
+  client: OpencodeClient,
+  sessionID: string,
+  text: string
+): Promise<void> {
+  await client.session.prompt({
+    path: { id: sessionID },
+    body: {
+      noReply: true,
+      parts: [{ type: "text", text, synthetic: true }],
+    },
+  });
+}
 
-  // Parse YAML into object (simple parser for basic key: value)
-  const frontmatterObj: Record<string, string> = {};
-  const lines = frontmatterText.split('\n');
-  for (const line of lines) {
-    const match = line.match(/^(\w+):\s*(.+)$/);
-    if (match) {
-      const [, key, value] = match;
-      frontmatterObj[key] = value.trim().replace(/^["']|["']$/g, '');
+/**
+ * Inject the available skills list into a session.
+ * Used on session start and after compaction.
+ */
+async function injectSkillsList(
+  client: OpencodeClient,
+  sessionID: string,
+  skills: SkillMetadata[]
+): Promise<void> {
+  if (skills.length === 0) return;
+
+  const skillsList = skills
+    .map(s => `- ${s.name}: ${s.description}`)
+    .join('\n');
+
+  await injectSyntheticContent(
+    client,
+    sessionID,
+    `<available-skills>
+Use the use_skill, read_skill_file, run_skill_script, and find_skills tools to work with skills.
+
+${skillsList}
+</available-skills>`
+  );
+}
+
+/**
+ * Find executable scripts in a skill's directory and scripts/ subdirectory.
+ * Only files with executable bit set are returned.
+ */
+async function findScripts(skillPath: string): Promise<Script[]> {
+  const scripts: Script[] = [];
+  const dirsToCheck = [skillPath, path.join(skillPath, 'scripts')];
+
+  for (const dir of dirsToCheck) {
+    try {
+      const entries = await fs.readdir(dir, { withFileTypes: true });
+
+      for (const entry of entries) {
+        if (!entry.isFile()) continue;
+
+        const fullPath = path.join(dir, entry.name);
+        const stats = await fs.stat(fullPath);
+
+        // Check executable bit (owner, group, or other)
+        if (stats.mode & 0o111) {
+          const nameWithoutExt = path.parse(entry.name).name;
+          scripts.push({
+            name: nameWithoutExt,
+            path: fullPath
+          });
+        }
+      }
+    } catch {
+      // Directory doesn't exist or not accessible - that's fine
     }
   }
 
-  // Validate with Zod
-  const parsed = skillFrontmatterSchema.safeParse(frontmatterObj);
-  if (!parsed.success) return null;
+  return scripts;
+}
 
-  const skillDir = path.dirname(skillPath);
-  const skillId = path.basename(skillDir);
+/**
+ * Parse a SKILL.md file and validate its frontmatter.
+ * Returns null if parsing fails (with error logging).
+ */
+async function parseSkillFile(
+  skillPath: string,
+  relativePath: string,
+  label: SkillLabel
+): Promise<SkillMetadata | null> {
+  const content = await fs.readFile(skillPath, 'utf-8').catch(() => null);
+  if (!content) {
+    return null;
+  }
+
+  // Extract frontmatter
+  const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
+  if (!frontmatterMatch?.[1] || !frontmatterMatch[2]) {
+    console.error(`   Skill at ${skillPath} has no valid frontmatter`);
+    return null;
+  }
+
+  const frontmatterText = frontmatterMatch[1];
+  const skillContent = frontmatterMatch[2].trim();
+
+  // Parse YAML
+  let frontmatterObj: unknown;
+  try {
+    frontmatterObj = yaml.load(frontmatterText);
+  } catch {
+    console.error(`   Invalid YAML in ${skillPath}`);
+    return null;
+  }
+
+  // Validate with Zod schema
+  let frontmatter: SkillFrontmatter;
+  try {
+    frontmatter = SkillFrontmatterSchema.parse(frontmatterObj);
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      console.error(`   Invalid frontmatter in ${skillPath}:`);
+      error.issues.forEach((err) => {
+        console.error(`     - ${err.path.join(".")}: ${err.message}`);
+      });
+    }
+    return null;
+  }
+
+  // Validate name matches directory
+  const skillDir = path.basename(path.dirname(skillPath));
+  if (frontmatter.name !== skillDir) {
+    console.error(
+      `   Name mismatch in ${skillPath}:`,
+      `\n     Frontmatter: "${frontmatter.name}"`,
+      `\n     Directory: "${skillDir}"`,
+      `\n     Fix: Rename directory or update frontmatter name field`
+    );
+    return null;
+  }
+
+  // Find scripts
+  const skillDirPath = path.dirname(skillPath);
+  const scripts = await findScripts(skillDirPath);
 
   return {
-    name: parsed.data.name,
-    description: parsed.data.description,
-    id: skillId,
-    path: skillDir,
+    name: frontmatter.name,
+    description: frontmatter.description,
+    path: skillDirPath,
+    relativePath,
+    namespace: frontmatter.metadata?.namespace,
+    label,
+    scripts,
     content: skillContent
   };
 }
 
-async function findSkillDirectories(baseDir: string): Promise<string[]> {
-  const skillPaths: string[] = [];
+/**
+ * Recursively find SKILL.md files in a directory.
+ */
+async function findSkillsRecursive(
+  baseDir: string,
+  label: SkillLabel,
+  maxDepth: number = 3
+): Promise<Array<{ skillPath: string; relativePath: string; label: SkillLabel }>> {
+  const results: Array<{ skillPath: string; relativePath: string; label: SkillLabel }> = [];
 
-  // Check if directory exists first
+  async function recurse(dir: string, depth: number, relPath: string) {
+    if (depth > maxDepth) return;
+
+    try {
+      const entries = await fs.readdir(dir, { withFileTypes: true });
+
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+
+        const fullPath = path.join(dir, entry.name);
+        const skillFile = path.join(fullPath, 'SKILL.md');
+        const newRelPath = relPath ? `${relPath}/${entry.name}` : entry.name;
+
+        try {
+          await fs.stat(skillFile);
+          results.push({
+            skillPath: skillFile,
+            relativePath: newRelPath,
+            label
+          });
+        } catch {
+          // No SKILL.md, recurse into subdirectories
+          await recurse(fullPath, depth + 1, newRelPath);
+        }
+      }
+    } catch {
+      // Directory doesn't exist or not accessible
+    }
+  }
+
   try {
     await fs.access(baseDir);
+    await recurse(baseDir, 0, '');
   } catch {
-    return skillPaths; // Directory doesn't exist, return empty array
+    // Base directory doesn't exist
   }
 
-  const entries = await fs.readdir(baseDir, { withFileTypes: true });
+  return results;
+}
 
-  for (const entry of entries) {
-    if (entry.isDirectory()) {
-      const skillPath = path.join(baseDir, entry.name, 'SKILL.md');
-      // Check if SKILL.md exists using fs.stat instead of fs.access
-      await fs.stat(skillPath)
-        .then(() => skillPaths.push(skillPath))
-        .catch(() => { }); // File doesn't exist, skip it
+/**
+ * Discover skills from Claude plugin marketplaces.
+ * Only loads skills from INSTALLED plugins (checked via installed_plugins.json).
+ */
+async function discoverMarketplaceSkills(
+  label: SkillLabel
+): Promise<Array<{ skillPath: string; relativePath: string; label: SkillLabel }>> {
+  const results: Array<{ skillPath: string; relativePath: string; label: SkillLabel }> = [];
+  const claudeDir = path.join(homedir(), '.claude', 'plugins');
+  const installedPath = path.join(claudeDir, 'installed_plugins.json');
+  const marketplacesDir = path.join(claudeDir, 'marketplaces');
+
+  // Read installed plugins
+  let installed: InstalledPlugins;
+  try {
+    const content = await fs.readFile(installedPath, 'utf-8');
+    installed = JSON.parse(content);
+  } catch {
+    // No installed plugins file
+    return results;
+  }
+
+  // Process each installed plugin (e.g., "document-skills@anthropic-agent-skills")
+  for (const pluginKey of Object.keys(installed.plugins || {})) {
+    const [pluginName, marketplaceName] = pluginKey.split('@');
+    if (!pluginName || !marketplaceName) continue;
+
+    // Read the marketplace manifest
+    const manifestPath = path.join(marketplacesDir, marketplaceName, '.claude-plugin', 'marketplace.json');
+    let manifest: MarketplaceManifest;
+    try {
+      const manifestContent = await fs.readFile(manifestPath, 'utf-8');
+      manifest = JSON.parse(manifestContent);
+    } catch {
+      continue; // Can't read manifest
+    }
+
+    // Find the specific plugin in the manifest
+    const plugin = manifest.plugins?.find(p => p.name === pluginName);
+    if (!plugin?.skills) continue;
+
+    // Load only skills from this installed plugin
+    for (const skillRelPath of plugin.skills) {
+      const cleanPath = skillRelPath.replace(/^\.\//, '');
+      const skillMdPath = path.join(marketplacesDir, marketplaceName, cleanPath, 'SKILL.md');
+
+      try {
+        await fs.stat(skillMdPath);
+        const skillName = path.basename(cleanPath);
+        results.push({
+          skillPath: skillMdPath,
+          relativePath: skillName,
+          label
+        });
+      } catch {
+        // SKILL.md doesn't exist
+      }
     }
   }
 
-  return skillPaths;
+  return results;
 }
 
-async function getAllSkills(directory: string, worktree: string): Promise<SkillMetadata[]> {
-  const skillDirs = [
-    path.join(directory, '.opencode', 'skills'),
-    path.join(directory, '.claude', 'skills'),
-    path.join(homedir(), '.config', 'opencode', 'skills'),
-    path.join(homedir(), '.claude', 'skills')
+/**
+ * Discover all skills from all locations.
+ *
+ * Discovery order (first found wins, OpenCode trumps Claude at each level):
+ * 1. .opencode/skills/                 (project - OpenCode)
+ * 2. .claude/skills/                   (project - Claude)
+ * 3. ~/.config/opencode/skills/        (user - OpenCode)
+ * 4. ~/.claude/skills/                 (user - Claude)
+ * 5. ~/.claude/plugins/marketplaces/   (installed plugins)
+ *
+ * No shadowing - unique names only. First match wins, duplicates are warned.
+ */
+async function discoverAllSkills(directory: string): Promise<Map<string, SkillMetadata>> {
+  const discoveryPaths: DiscoveryPath[] = [
+    {
+      path: path.join(directory, '.opencode', 'skills'),
+      label: 'project',
+      maxDepth: 3
+    },
+    {
+      path: path.join(directory, '.claude', 'skills'),
+      label: 'claude-project',
+      maxDepth: 1
+    },
+    {
+      path: path.join(homedir(), '.config', 'opencode', 'skills'),
+      label: 'user',
+      maxDepth: 3
+    },
+    {
+      path: path.join(homedir(), '.claude', 'skills'),
+      label: 'claude-user',
+      maxDepth: 1
+    }
   ];
 
-  const allSkillPaths: string[] = [];
+  const skillsByName = new Map<string, SkillMetadata>();
 
-  for (const dir of skillDirs) {
-    const paths = await findSkillDirectories(dir);
-    allSkillPaths.push(...paths);
-  }
+  // Process standard discovery paths
+  for (const { path: baseDir, label, maxDepth } of discoveryPaths) {
+    const found = await findSkillsRecursive(baseDir, label, maxDepth);
 
-  const skills: SkillMetadata[] = [];
+    for (const { skillPath, relativePath, label: skillLabel } of found) {
+      const skill = await parseSkillFile(skillPath, relativePath, skillLabel);
+      if (!skill) continue;
 
-  for (const skillPath of allSkillPaths) {
-    const skill = await parseSkillFile(skillPath);
-    if (skill) {
-      skills.push({
-        name: skill.name,
-        description: skill.description,
-        id: skill.id,
-        path: skill.path
-      });
+      const existing = skillsByName.get(skill.name);
+      if (existing) {
+        // Silently skip duplicates - first found wins
+        continue;
+      }
+
+      skillsByName.set(skill.name, skill);
     }
   }
 
-  return skills;
+  const marketplaceSkills = await discoverMarketplaceSkills('claude-plugins');
+
+  for (const { skillPath, relativePath, label } of marketplaceSkills) {
+    const skill = await parseSkillFile(skillPath, relativePath, label);
+    if (!skill) continue;
+
+    const existing = skillsByName.get(skill.name);
+    if (existing) {
+      // Silently skip duplicates - first found wins
+      continue;
+    }
+
+    skillsByName.set(skill.name, skill);
+  }
+
+  return skillsByName;
 }
 
-export const SkillsPlugin: Plugin = async ({ client, $, worktree, directory }) => {
-  // Cache for loaded skills content (not metadata)
-  const loadedSkills = new Map<string, ParsedSkill>();
+/**
+ * Resolve a skill by name, handling namespace prefixes.
+ * Supports: "skill-name", "project:skill-name", "user:skill-name", etc.
+ */
+function resolveSkill(
+  skillName: string,
+  skillsByName: Map<string, SkillMetadata>
+): SkillMetadata | null {
+  // Check for namespace prefix
+  if (skillName.includes(':')) {
+    const [namespace, name] = skillName.split(':');
+
+    // Look for skill with matching name AND label/namespace
+    for (const skill of skillsByName.values()) {
+      if (skill.name === name && (skill.label === namespace || skill.namespace === namespace)) {
+        return skill;
+      }
+    }
+    return null;
+  }
+
+  // Direct lookup by name
+  return skillsByName.get(skillName) || null;
+}
+
+/**
+ * Check if a path is safely within a base directory (no escape via ..)
+ */
+function isPathSafe(basePath: string, requestedPath: string): boolean {
+  const resolved = path.resolve(basePath, requestedPath);
+  return resolved.startsWith(basePath + path.sep) || resolved === basePath;
+}
+
+export const SkillsPlugin: Plugin = async ({ client, $, directory }) => {
+  // Discover all skills at startup
+  const skillsByName = await discoverAllSkills(directory);
+  const allSkills = Array.from(skillsByName.values());
+
+  const injectedSessions = new Set<string>();
+
+  // Tool translation guide for skills written for Claude Code
+  const toolTranslation = `<tool-translation>
+This skill may reference Claude Code tools. Use OpenCode equivalents:
+- TodoWrite/TodoRead -> todowrite/todoread
+- Task (subagents) -> task tool with subagent_type parameter
+- Skill tool -> use_skill tool
+- Read/Write/Edit/Bash/Glob/Grep/WebFetch -> lowercase (read/write/edit/bash/glob/grep/webfetch)
+</tool-translation>`;
+
+  const tools: Record<string, ToolDefinition> = {};
+
 
   return {
-    // Inject skill metadata into system prompt
-    "session.prompt.system": async () => {
-      const availableSkills = await getAllSkills(directory, worktree);
-      
-      if (availableSkills.length === 0) {
-        return "";
+    "chat.message": async (_input, output) => {
+      const sessionID = output.message.sessionID;
+
+      // Skip if already injected this session (in-memory fast path)
+      if (injectedSessions.has(sessionID)) return;
+
+      // Check if session already has messages (handles plugin reload/reconnection)
+      try {
+        const existing = await client.session.messages({
+          path: { id: sessionID },
+          query: { limit: 1 }
+        });
+
+        if (existing.data && existing.data.length > 0) {
+          injectedSessions.add(sessionID);
+          return;
+        }
+      } catch {
+        // On error, proceed with injection
       }
 
-      const skillsList = availableSkills
-        .map(skill => `- ${skill.name} (${skill.id}): ${skill.description}`)
-        .join('\n');
+      injectedSessions.add(sessionID);
+      await injectSkillsList(client, sessionID, allSkills);
+    },
 
-      return `
-## Available Skills
-
-The following skills are available for use. Use the find_skills tool to discover relevant skills for your task, then use activate_skill to load a skill's instructions when needed.
-
-${skillsList}
-
-Remember to use the find_skills tool at the start of tasks to discover relevant skills that could help.`;
+    event: async ({ event }) => {
+      // Re-inject skills list after context compaction
+      if (event.type === 'session.compacted') {
+        const sessionID = event.properties.sessionID;
+        await injectSkillsList(client, sessionID, allSkills);
+      }
     },
 
     tool: {
       find_skills: tool({
-        description: "Search and discover available skills. Use this at the start of any task to find relevant skills that could help. Returns a list of skills with their metadata.",
+        description: "List available skills with their descriptions. Optionally filter by query.",
         args: {
           query: tool.schema.string().optional()
-            .describe("Optional search query to filter skills by name or description (case-insensitive)")
+            .describe("Search query to filter skills (matches name and description)")
         },
         async execute(args) {
-          const availableSkills = await getAllSkills(directory, worktree);
-          let filteredSkills = availableSkills;
+          let filtered = allSkills;
 
           if (args.query) {
-            const query = args.query.toLowerCase();
-            filteredSkills = availableSkills.filter(skill =>
-              skill.name.toLowerCase().includes(query) ||
-              skill.description.toLowerCase().includes(query) ||
-              skill.id.toLowerCase().includes(query)
+            const pattern = new RegExp(args.query.replace(/\*/g, '.*'), 'i');
+            filtered = filtered.filter(s =>
+              pattern.test(s.name) || pattern.test(s.description)
             );
           }
 
-          if (filteredSkills.length === 0) {
+          if (filtered.length === 0) {
             return "No skills found matching your query.";
           }
 
-          const result = filteredSkills
-            .map(skill => `${skill.name} (${skill.id}): ${skill.description}`)
-            .join('\n');
-
-          return result;
-        },
-      }),
-
-      activate_skill: tool({
-        description: "Load a skill by injecting its SKILL.md content into the conversation. This brings the skill's instructions into context.",
-        args: {
-          skill_id: tool.schema.string()
-            .describe("The ID of the skill to activate (from find_skills)")
-        },
-        async execute(args) {
-          // Check if already loaded
-          if (loadedSkills.has(args.skill_id)) {
-            const skill = loadedSkills.get(args.skill_id)!;
-            return skill.content;
-          }
-
-          // Find skill in available skills
-          const availableSkills = await getAllSkills(directory, worktree);
-          const skillMeta = availableSkills.find(s => s.id === args.skill_id);
-
-          if (!skillMeta) {
-            return `Skill "${args.skill_id}" not found`;
-          }
-
-          // Load the skill content
-          const skillPath = path.join(skillMeta.path, 'SKILL.md');
-          const skill = await parseSkillFile(skillPath);
-
-          if (!skill) {
-            return `Failed to load skill "${args.skill_id}"`;
-          }
-
-          // Cache the loaded skill
-          loadedSkills.set(args.skill_id, skill);
-
-          return skill.content;
-        },
-      }),
-
-      run_skill_script: tool({
-        description: "Execute a script within a skill's directory. Scripts can be any executable file in the skill folder.",
-        args: {
-          skill_id: tool.schema.string()
-            .describe("The ID of the skill containing the script"),
-          script: tool.schema.string()
-            .describe("The script filename or path relative to the skill directory"),
-          args: tool.schema.array(tool.schema.string()).optional()
-            .describe("Optional arguments to pass to the script")
-        },
-        async execute(args) {
-          const availableSkills = await getAllSkills(directory, worktree);
-          const skillMeta = availableSkills.find(s => s.id === args.skill_id);
-
-          if (!skillMeta) {
-            return `Skill "${args.skill_id}" not found`;
-          }
-
-          const scriptPath = path.join(skillMeta.path, args.script);
-
-          try {
-            // Check if script exists
-            await fs.access(scriptPath);
-
-            // Use Bun's $ shell to execute the script but with proper cwd
-            const scriptArgs = args.args || [];
-
-            // Set cwd and execute script
-            $.cwd(skillMeta.path);
-            const result = await $`${scriptPath} ${scriptArgs}`.text();
-
-            return result;
-          } catch (error: any) {
-            if (error.code === 'ENOENT') {
-              return `Script "${args.script}" not found in skill "${args.skill_id}"`;
-            }
-
-            // Check if it's a Bun shell error
-            if (error.exitCode !== undefined) {
-              const stderr = error.stderr?.toString() || '';
-              const stdout = error.stdout?.toString() || '';
-              return `Script failed (exit code ${error.exitCode}): ${stderr || stdout || error.message}`;
-            }
-
-            return `Script failed: ${error.message}`;
-          }
-        },
-      }),
-
-      list_skill_files: tool({
-        description: "List all files in a skill's directory, useful for exploring skill resources.",
-        args: {
-          skill_id: tool.schema.string()
-            .describe("The ID of the skill to explore")
-        },
-        async execute(args) {
-          const availableSkills = await getAllSkills(directory, worktree);
-          const skillMeta = availableSkills.find(s => s.id === args.skill_id);
-
-          if (!skillMeta) {
-            return `Skill "${args.skill_id}" not found`;
-          }
-
-          async function listFiles(dir: string, prefix = ''): Promise<string[]> {
-            const entries = await fs.readdir(dir, { withFileTypes: true });
-            const files: string[] = [];
-
-            for (const entry of entries) {
-              const relativePath = prefix ? path.join(prefix, entry.name) : entry.name;
-              if (entry.isDirectory()) {
-                const subFiles = await listFiles(path.join(dir, entry.name), relativePath);
-                files.push(...subFiles);
-              } else {
-                files.push(relativePath);
-              }
-            }
-
-            return files;
-          }
-
-          try {
-            const files = await listFiles(skillMeta.path);
-            return files.sort().join('\n');
-          } catch (error: any) {
-            return `Failed to list files: ${error.message}`;
-          }
-        },
+          return filtered
+            .map(s => {
+              const scripts = s.scripts.length > 0
+                ? ` [scripts: ${s.scripts.map(sc => sc.name).join(', ')}]`
+                : '';
+              return `${s.name} (${s.label})\n  ${s.description}${scripts}`;
+            })
+            .join('\n\n');
+        }
       }),
 
       read_skill_file: tool({
-        description: "Read a specific file from a skill's directory.",
+        description: "Read a supporting file from a skill's directory (docs, examples, configs).",
         args: {
-          skill_id: tool.schema.string()
-            .describe("The ID of the skill containing the file"),
-          file_path: tool.schema.string()
-            .describe("Path to the file relative to the skill directory")
+          skill_name: tool.schema.string()
+            .describe("Name of the skill"),
+          filename: tool.schema.string()
+            .describe("File to read, relative to skill directory (e.g., 'anthropic-best-practices.md', 'scripts/helper.sh')")
         },
-        async execute(args) {
-          const availableSkills = await getAllSkills(directory, worktree);
-          const skillMeta = availableSkills.find(s => s.id === args.skill_id);
+        async execute(args, ctx) {
+          const skill = resolveSkill(args.skill_name, skillsByName);
 
-          if (!skillMeta) {
-            return `Skill "${args.skill_id}" not found`;
+          if (!skill) {
+            return `Skill "${args.skill_name}" not found. Use find_skills to see available skills.`;
           }
 
-          const filePath = path.join(skillMeta.path, args.file_path);
+          // Security: ensure path doesn't escape skill directory
+          if (!isPathSafe(skill.path, args.filename)) {
+            return `Invalid path: cannot access files outside skill directory.`;
+          }
+
+          const filePath = path.join(skill.path, args.filename);
 
           try {
             const content = await fs.readFile(filePath, 'utf-8');
-            return content;
-          } catch (error: any) {
-            if (error.code === 'ENOENT') {
-              return `File "${args.file_path}" not found in skill "${args.skill_id}"`;
+
+            // Inject via noReply for context persistence
+            const wrappedContent = `<skill-file skill="${skill.name}" file="${args.filename}">
+  <metadata>
+    <directory>${skill.path}</directory>
+  </metadata>
+
+  <content>
+${content}
+  </content>
+</skill-file>`;
+
+            await injectSyntheticContent(client, ctx.sessionID, wrappedContent);
+
+            return `File "${args.filename}" from skill "${skill.name}" loaded.`;
+          } catch {
+            // List available files on error
+            try {
+              const files = await fs.readdir(skill.path);
+              return `File "${args.filename}" not found. Available files: ${files.join(', ')}`;
+            } catch {
+              return `File "${args.filename}" not found in skill "${skill.name}".`;
             }
-            return `Failed to read file: ${error.message}`;
           }
+        }
+      }),
+
+      run_skill_script: tool({
+        description: "Execute a script from a skill's directory. Scripts are run with the skill directory as CWD.",
+        args: {
+          skill_name: tool.schema.string()
+            .describe("Name of the skill"),
+          script_name: tool.schema.string()
+            .describe("Name of the script to run (with or without extension)"),
+          arguments: tool.schema.array(tool.schema.string()).optional()
+            .describe("Arguments to pass to the script")
         },
-      })
+        async execute(args) {
+          const skill = resolveSkill(args.skill_name, skillsByName);
+
+          if (!skill) {
+            return `Skill "${args.skill_name}" not found. Use find_skills to see available skills.`;
+          }
+
+          // Find the script
+          const script = skill.scripts.find(s =>
+            s.name === args.script_name ||
+            s.name === path.parse(args.script_name).name
+          );
+
+          if (!script) {
+            const available = skill.scripts.map(s => s.name).join(', ') || 'none';
+            return `Script "${args.script_name}" not found in skill "${skill.name}". Available scripts: ${available}`;
+          }
+
+          try {
+            $.cwd(skill.path);
+            const scriptArgs = args.arguments || [];
+            const result = await $`${script.path} ${scriptArgs}`.text();
+            return result;
+          } catch (error: unknown) {
+            if (error instanceof Error && 'exitCode' in error) {
+              const shellError = error as Error & { exitCode: number; stderr?: Buffer; stdout?: Buffer };
+              const stderr = shellError.stderr?.toString() || '';
+              const stdout = shellError.stdout?.toString() || '';
+              return `Script failed (exit ${shellError.exitCode}): ${stderr || stdout || shellError.message}`;
+            }
+            if (error instanceof Error) {
+              return `Script failed: ${error.message}`;
+            }
+            return `Script failed: ${String(error)}`;
+          }
+        }
+      }),
+
+      use_skill: tool({
+        description: "Load a skill's SKILL.md content into context. Skills contain proven workflows, techniques, and patterns.",
+        args: {
+          skill_name: tool.schema.string()
+            .describe("Name of the skill (e.g., 'brainstorming', 'project:my-skill', 'user:my-skill')")
+        },
+        async execute(args, ctx) {
+          const skill = resolveSkill(args.skill_name, skillsByName);
+
+          if (!skill) {
+            const available = allSkills.map(s => s.name).join(', ');
+            return `Skill "${args.skill_name}" not found. Available skills: ${available}`;
+          }
+
+          const scriptsXml = skill.scripts.length > 0
+            ? `\n    <scripts>\n${skill.scripts.map(s => `      <script>${s.name}</script>`).join('\n')}\n    </scripts>`
+            : '';
+
+          const skillContent = `<skill name="${skill.name}">
+  <metadata>
+    <source>${skill.label}</source>
+    <directory>${skill.path}</directory>${scriptsXml}
+  </metadata>
+
+  ${toolTranslation}
+
+  <content>
+${skill.content}
+  </content>
+</skill>`;
+
+          await injectSyntheticContent(client, ctx.sessionID, skillContent);
+
+          const scriptInfo = skill.scripts.length > 0
+            ? `\nAvailable scripts: ${skill.scripts.map(s => s.name).join(', ')}`
+            : '';
+
+          return `Skill "${skill.name}" loaded.${scriptInfo}`;
+        }
+      }),
     }
   };
 };

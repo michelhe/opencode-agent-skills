@@ -1,5 +1,5 @@
 ---
-name: Git Helper
+name: git-helper
 description: Provides git workflow assistance, branch management, and commit message optimization
 ---
 

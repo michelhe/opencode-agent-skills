@@ -1,0 +1,35 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project attempts to adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+<!--
+## [${version}]
+### Added - for new features
+### Changed - for changes in existing functionality
+### Deprecated - for soon-to-be removed features
+### Removed - for now removed features
+### Fixed - for any bug fixes
+### Security - in case of vulnerabilities
+[${version}]: https://github.com/joshuadavidthomas/opencode-agent-skills/releases/tag/v${version}
+-->
+
+## [Unreleased]
+
+### Added
+
+- Added `use_skill` tool to load skill content into context
+- Added `read_skill_file` tool to read supporting files from skill directories
+- Added `run_skill_script` tool to execute scripts from skill directories
+- Added `find_skills` tool to search and list available skills
+- Added multi-location skill discovery (project, user, and Claude-compatible locations)
+- Added Anthropic Agent Skills Spec v1.0 compliant frontmatter validation
+- Added automatic skills list injection on session start and after context compaction
+
+### New Contributors
+
+- Josh Thomas <josh@joshthomas.dev> (maintainer)
+
+[unreleased]: https://github.com/joshuadavidthomas/opencode-agent-skills/commits/main

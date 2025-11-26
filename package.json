@@ -1,20 +1,23 @@
 {
-  "name": "superpowers-skill",
+  "name": "opencode-agent-skills",
   "version": "0.1.0",
   "main": "src/plugin.ts",
   "type": "module",
   "scripts": {
-    "build": "tsc --noEmit",
-    "install-plugin": "cp src/plugin.ts ~/.config/opencode/plugin/skills.ts",
-    "test": "bun test"
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "^0.15.7"
+    "@opencode-ai/plugin": "^1.0.115",
+    "js-yaml": "^4.1.1",
+    "zod": "^4.1.13"
   },
   "devDependencies": {
-    "@types/bun": "^1.0.0",
-    "@types/node": "^24.0.0",
-    "typescript": "^5.0.0"
+    "@tsconfig/bun": "^1.0.10",
+    "@types/bun": "^1.3.3",
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^24.10.1",
+    "typescript": "^5.9.3"
   },
   "engines": {
     "bun": ">=1.0.0"
